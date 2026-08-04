@@ -1,0 +1,1197 @@
+openapi: 3.1.0
+
+info:
+  title: Justworx Developer API
+  version: 1.0.0
+  summary: Curated, versioned public API to monitor and control Justworx devices.
+  description: |
+    The **Justworx Developer API** (`/api/dev/v1`) is the single, stable, external-facing
+    surface to build on — Home Assistant, the MCP server, the TypeScript SDK, ChatGPT Actions,
+    Zapier/n8n, and any custom integration. It exposes a **curated, stable, and safe** subset of
+    the Justworx platform: list devices, read live state, actuate, and subscribe to events.
+    Device command codes, encryption keys, and provisioning are never exposed — actuation is
+    handled securely on the server.
+
+    ## Authentication
+    Every request must present **one** of:
+      * an **API key** — `Authorization: Bearer jwx_live_…` (the default for machine clients:
+        MCP, Zapier, server-to-server, Bubble/FlutterFlow server side). Keys are issued in the
+        developer portal, are shown once, and carry a fixed set of scopes.
+      * an **OAuth 2.0 access token** (authorization-code flow) — used by consumer platforms
+        that account-link a Justworx user (Alexa, Google Home, Home Assistant). The token
+        resolves to the same Justworx account.
+
+    Both resolve to a Justworx account and are constrained by the **scopes** granted to the
+    credential. A call needing a scope the credential lacks returns `403 FORBIDDEN`.
+
+    ## Scopes
+    | Scope | Grants |
+    |-------|--------|
+    | `devices:read` | List devices and read device state. |
+    | `devices:command` | Send actuation commands to a device. |
+    | `events:read` | Read a device's event history. |
+    | `webhooks:manage` | Create, list, and delete outbound webhook subscriptions. |
+
+    ## Conventions
+    * Base URL: `https://dev-api.justworx.com/api/dev/v1`.
+    * All request and response bodies are JSON (`Content-Type: application/json`).
+    * Timestamps are RFC 3339 / ISO-8601 UTC (`2026-08-02T14:03:11.000Z`).
+    * A device's identifier is its **`serialNumber`** — an 8-character serial (`[A-Z0-9]{8}`).
+      Every path, response, and event uses the serial number.
+    * List endpoints are **cursor-paginated**: pass the previous response's `nextCursor` back as
+      `cursor` to page forward. A `null` `nextCursor` means the last page.
+    * Errors are always `{ "error": "CODE", "detail": "…"? }` with the HTTP status set to match.
+
+    ## Rate limiting
+    Each credential has a per-key request budget. Every response carries `X-RateLimit-Limit`,
+    `X-RateLimit-Remaining`, and `X-RateLimit-Reset` (epoch seconds). Exceeding the budget
+    returns `429 RATE_LIMITED` with a `Retry-After` header.
+
+    ## Confirmed vs. fire-and-forget actuation
+    `POST /devices/{serial}/commands` accepts an optional `timeoutMs`. With it, the call blocks
+    for a **confirmed** device reply (real state), returning `200`; if the device doesn't reply in
+    time you get `202 { "status": "pending" }` and — if you have a matching webhook — the late
+    `command_reply` is delivered there. Without `timeoutMs` the command is fire-and-forget (`202`).
+  contact:
+    name: Justworx Developer Platform
+    url: https://build.justworx.com
+  license:
+    name: Proprietary
+    url: https://justworx.com/legal/developer-api-terms
+
+servers:
+  - url: https://dev-api.justworx.com/api/dev/v1
+    description: Production
+
+tags:
+  - name: Devices
+    description: List devices and read live state.
+  - name: Commands
+    description: Actuate a device (set/pulse an IO, enable/disable a rule).
+  - name: Events
+    description: Read a device's event history.
+  - name: Webhooks
+    description: Subscribe to real-time device events (account-scoped, HMAC-signed).
+  - name: Meta
+    description: Credential introspection and service metadata.
+
+security:
+  - apiKey: []
+  - oauth2:
+      - devices:read
+      - devices:command
+      - events:read
+      - webhooks:manage
+
+paths:
+  /whoami:
+    get:
+      operationId: whoami
+      tags: [Meta]
+      summary: Introspect the calling credential
+      description: >
+        Returns the Justworx account the credential resolves to, the scopes it holds, and how it
+        authenticated. Useful for verifying an API key or a freshly linked OAuth token.
+      security:
+        - apiKey: []
+        - oauth2: []
+      responses:
+        '200':
+          description: Credential resolved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhoAmI'
+              example:
+                accountId: 6b1f0c3e-2a44-4a1e-9f0a-2c1d9e8b7a10
+                authType: api_key
+                clientName: Acme Home Assistant
+                scopes: [devices:read, devices:command, events:read]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /devices:
+    get:
+      operationId: listDevices
+      tags: [Devices]
+      summary: List accessible devices
+      description: >
+        Returns every device the credential's account can access (owned devices plus valid
+        shares). Cursor-paginated.
+      security:
+        - apiKey: [devices:read]
+        - oauth2: [devices:read]
+      parameters:
+        - name: status
+          in: query
+          description: Filter by device status.
+          required: false
+          schema:
+            $ref: '#/components/schemas/DeviceStatus'
+        - name: productId
+          in: query
+          description: Filter to devices of a single product.
+          required: false
+          schema:
+            type: string
+        - name: online
+          in: query
+          description: Filter by current liveness.
+          required: false
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeviceSummary'
+                  nextCursor:
+                    $ref: '#/components/schemas/NextCursor'
+              example:
+                items:
+                  - serialNumber: ABCD1234
+                    name: Front Gate
+                    status: claimed
+                    productId: 665f2a1b9c0e4d0011a2b3c4
+                    online: true
+                    lastSeen: '2026-08-02T13:59:02.000Z'
+                    access: owner
+                nextCursor: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /devices/{serial}:
+    parameters:
+      - $ref: '#/components/parameters/Serial'
+    get:
+      operationId: getDevice
+      tags: [Devices]
+      summary: Get a device with live state
+      description: >
+        Full current state of one device from its digital twin — status, network, every IO with
+        its current value, decoded rules, and (when available) location. Reads the stored twin;
+        no device round-trip.
+      security:
+        - apiKey: [devices:read]
+        - oauth2: [devices:read]
+      responses:
+        '200':
+          description: The device.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /devices/{serial}/commands:
+    parameters:
+      - $ref: '#/components/parameters/Serial'
+    post:
+      operationId: sendCommand
+      tags: [Commands]
+      summary: Send an actuation command
+      description: |
+        Actuate a device. The `type` field selects one
+        of the curated command shapes:
+
+        * `set_io` — set an IO to a state and hold it (latch).
+        * `pulse_io` — drive an IO to a state for `durationMs`, then revert.
+        * `set_rule_enabled` — enable or disable an on-device rule.
+
+        Provide `timeoutMs` (1–30000) to wait for a **confirmed** reply (real device state);
+        omit it for fire-and-forget.
+
+        Pass an `Idempotency-Key` header to make retries safe — a repeated key within the
+        idempotency window returns the original result instead of re-actuating.
+      security:
+        - apiKey: [devices:command]
+        - oauth2: [devices:command]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Command'
+            examples:
+              setIo:
+                summary: Latch an output high
+                value:
+                  type: set_io
+                  io: 10
+                  state: high
+                  timeoutMs: 5000
+              pulseIo:
+                summary: Pulse an output for 5 s then revert
+                value:
+                  type: pulse_io
+                  io: 10
+                  state: high
+                  durationMs: 5000
+                  revertState: low
+              setRuleEnabled:
+                summary: Disable a rule
+                value:
+                  type: set_rule_enabled
+                  ruleId: 3
+                  enabled: false
+      responses:
+        '200':
+          description: Confirmed — the device replied within `timeoutMs`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandConfirmed'
+              example:
+                status: confirmed
+                serialNumber: ABCD1234
+                applied:
+                  - io: 10
+                    state: high
+                at: '2026-08-02T14:03:11.200Z'
+        '202':
+          description: >
+            Accepted. Either fire-and-forget (no `timeoutMs`) or the device did not reply in time;
+            the eventual result arrives via a `command_reply` webhook if one is registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandPending'
+              example:
+                status: pending
+                serialNumber: ABCD1234
+                note: command published; result will arrive on the command_reply webhook
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Command not valid for this device (e.g. IO or rule does not exist on it).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: CONFLICT
+                detail: IO 10 is not defined on device ABCD1234
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /devices/{serial}/events:
+    parameters:
+      - $ref: '#/components/parameters/Serial'
+    get:
+      operationId: listDeviceEvents
+      tags: [Events]
+      summary: Read a device's event history
+      description: >
+        The device's reply/event history from the event log (auto-retained on the server).
+        Cursor-paginated, newest first. Filter by time window and/or event type.
+      security:
+        - apiKey: [events:read]
+        - oauth2: [events:read]
+      parameters:
+        - name: from
+          in: query
+          description: Start of the window (inclusive). Defaults to 24 h ago.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End of the window (inclusive). Defaults to now.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: type
+          in: query
+          description: Filter to a single event type.
+          required: false
+          schema:
+            $ref: '#/components/schemas/EventType'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [serialNumber, items, nextCursor]
+                properties:
+                  serialNumber:
+                    type: string
+                    description: The device's serial (its public identifier).
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Event'
+                  nextCursor:
+                    $ref: '#/components/schemas/NextCursor'
+              example:
+                serialNumber: ABCD1234
+                items:
+                  - type: io_state_change
+                    at: '2026-08-02T14:03:11.200Z'
+                    io: 10
+                    state: high
+                nextCursor: eyJvIjoxMDB9
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /events/stream:
+    get:
+      operationId: streamEvents
+      tags: [Events]
+      summary: Real-time state push (Server-Sent Events)
+      description: >
+        A long-lived **Server-Sent Events** stream of the account's device state changes — push
+        instead of polling. On connect the server sends a `snapshot` of current twin state, then
+        `state_change` / `device_online` / `device_offline` events as they happen, plus a `ping`
+        keepalive (~every 25s). Carries **only the calling account's** devices. Reconnect with
+        standard SSE `retry`/`Last-Event-ID`; a fresh `snapshot` is sent on every (re)connect.
+      security:
+        - apiKey: [devices:read]
+        - oauth2: [devices:read]
+      parameters:
+        - name: devices
+          in: query
+          required: false
+          description: Comma-separated device serials to narrow the stream (intersected with the account's devices).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: An open SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames (`event:` + `data:` JSON). See EventType + `snapshot`/`ping`.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /webhooks:
+    get:
+      operationId: listWebhooks
+      tags: [Webhooks]
+      summary: List webhook subscriptions
+      description: All webhook subscriptions owned by the credential's account. Secrets are never returned.
+      security:
+        - apiKey: [webhooks:manage]
+        - oauth2: [webhooks:manage]
+      responses:
+        '200':
+          description: The account's subscriptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      operationId: createWebhook
+      tags: [Webhooks]
+      summary: Create a webhook subscription
+      description: |
+        Register a URL to receive device events. Scope with `serialNumber` (a single device) or omit
+        it to receive events for **all** of the account's devices.
+
+        The response includes a **`secret`, shown once** — store it. Every delivery is signed
+        `X-Justworx-Signature: sha256=<HMAC-SHA256(secret, rawBody)>`; verify it before trusting a
+        payload.
+      security:
+        - apiKey: [webhooks:manage]
+        - oauth2: [webhooks:manage]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookCreate'
+            example:
+              url: https://acme.example.com/justworx/hook
+              events: [io_state_change, device_online, device_offline]
+              serialNumber: ABCD1234
+      responses:
+        '201':
+          description: Subscription created. `secret` is present only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookCreated'
+              example:
+                id: wh_9c0e4d0011a2b3c4
+                url: https://acme.example.com/justworx/hook
+                events: [io_state_change, device_online, device_offline]
+                serialNumber: ABCD1234
+                secret: "shown-once-at-creation"
+                createdAt: '2026-08-02T14:05:00.000Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /webhooks/{webhookId}:
+    parameters:
+      - name: webhookId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: The subscription id returned at creation.
+    get:
+      operationId: getWebhook
+      tags: [Webhooks]
+      summary: Get a webhook subscription
+      security:
+        - apiKey: [webhooks:manage]
+        - oauth2: [webhooks:manage]
+      responses:
+        '200':
+          description: The subscription (no secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      operationId: deleteWebhook
+      tags: [Webhooks]
+      summary: Delete a webhook subscription
+      security:
+        - apiKey: [webhooks:manage]
+        - oauth2: [webhooks:manage]
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: boolean
+                    const: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+webhooks:
+  deviceEvent:
+    post:
+      operationId: receiveDeviceEvent
+      summary: Outbound device event delivery
+      description: >
+        The request Justworx sends to a URL registered via `POST /webhooks`. Documented here for
+        integrators building a receiver — it is delivered to **your** endpoint, not called on this
+        API. Each delivery is signed `X-Justworx-Signature: sha256=<HMAC-SHA256(secret, rawBody)>`;
+        verify the signature against the subscription `secret` before trusting the body. Respond
+        `2xx` to acknowledge.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookDelivery'
+            example:
+              event: io_state_change
+              serialNumber: ABCD1234
+              data:
+                io: 10
+                state: high
+              at: '2026-08-02T14:03:11.200Z'
+      responses:
+        '2XX':
+          description: Delivery acknowledged by the receiver.
+
+components:
+
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: jwx_live_key
+      description: >
+        A long-lived API key issued in the developer portal, sent as
+        `Authorization: Bearer jwx_live_…`. The default auth for machine clients.
+    oauth2:
+      type: oauth2
+      description: >
+        OAuth 2.0 authorization-code flow (with PKCE for public clients), issued by the Justworx
+        authorization server. Used by account-linked consumer platforms (Alexa, Google Home,
+        Home Assistant). The token resolves to the linked Justworx account.
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.justworx.com/oauth2/auth
+          tokenUrl: https://auth.justworx.com/oauth2/token
+          refreshUrl: https://auth.justworx.com/oauth2/token
+          scopes:
+            devices:read: List devices and read device state.
+            devices:command: Send actuation commands to a device.
+            events:read: Read a device's event history.
+            webhooks:manage: Create, list, and delete webhook subscriptions.
+
+  parameters:
+    Serial:
+      name: serial
+      in: path
+      required: true
+      description: The device's public identifier — its 8-character serial (`[A-Z0-9]{8}`).
+      schema:
+        type: string
+      example: ABCD1234
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum items to return per page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor from a previous response's `nextCursor`.
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        Client-generated unique key. Repeating a request with the same key within the idempotency
+        window returns the original result instead of actuating again.
+      schema:
+        type: string
+        maxLength: 255
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad JSON, unknown field, wrong shape).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: BAD_REQUEST
+            detail: 'body: unexpected field "foo"'
+    Unauthorized:
+      description: Missing, malformed, or invalid credential.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: UNAUTHORIZED
+    Forbidden:
+      description: The credential lacks the scope required for this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: FORBIDDEN
+            detail: requires scope devices:command
+    NotFound:
+      description: No such resource, or not accessible to this account.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: NOT_FOUND
+    Unprocessable:
+      description: Well-formed but semantically invalid (e.g. value out of range).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: UNPROCESSABLE
+            detail: timeoutMs must be between 1 and 30000
+    RateLimited:
+      description: Per-key rate limit exceeded.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: RATE_LIMITED
+            detail: retry after 12s
+
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code.
+          examples: [UNAUTHORIZED, FORBIDDEN, NOT_FOUND, BAD_REQUEST, UNPROCESSABLE, CONFLICT, RATE_LIMITED]
+        detail:
+          type: string
+          description: Optional human-readable explanation.
+
+    NextCursor:
+      type: [string, 'null']
+      description: Cursor to pass as `cursor` for the next page, or `null` on the last page.
+
+    WhoAmI:
+      type: object
+      required: [accountId, authType, scopes]
+      properties:
+        accountId:
+          type: string
+          description: The Justworx account the credential resolves to.
+        authType:
+          type: string
+          enum: [api_key, oauth2]
+        clientName:
+          type: string
+          description: Human label for the API key or OAuth client.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Scope'
+
+    Scope:
+      type: string
+      enum:
+        - devices:read
+        - devices:command
+        - events:read
+        - webhooks:manage
+
+    DeviceStatus:
+      type: string
+      description: Lifecycle status of a device.
+      enum: [unclaimed, claimed, online, offline]
+
+    IoState:
+      description: >
+        A logical IO state. `high`/`low` for digital; a number for analog/virtual. `change` is
+        accepted only where a transition is meaningful.
+      oneOf:
+        - type: string
+          enum: [high, low]
+        - type: number
+      examples: [high, low, 3.25]
+
+    DeviceSummary:
+      type: object
+      required: [serialNumber, status, online]
+      properties:
+        serialNumber:
+          type: string
+          description: The device's public identifier — its 8-character serial (`[A-Z0-9]{8}`).
+        name:
+          type: [string, 'null']
+          description: User-set label, if any.
+        status:
+          $ref: '#/components/schemas/DeviceStatus'
+        productId:
+          type: [string, 'null']
+        online:
+          type: boolean
+        lastSeen:
+          type: [string, 'null']
+          format: date-time
+        access:
+          type: string
+          enum: [owner, shared]
+          description: How the calling account sees this device.
+
+    Device:
+      type: object
+      required: [serialNumber, status, online, io]
+      properties:
+        serialNumber:
+          type: string
+          description: The device's public identifier — its 8-character serial (`[A-Z0-9]{8}`).
+        name:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/DeviceStatus'
+        productId:
+          type: [string, 'null']
+        online:
+          type: boolean
+        lastSeen:
+          type: [string, 'null']
+          format: date-time
+        access:
+          type: string
+          enum: [owner, shared]
+        network:
+          $ref: '#/components/schemas/Network'
+        location:
+          $ref: '#/components/schemas/Location'
+        io:
+          type: array
+          description: Every IO on the device with its current value.
+          items:
+            $ref: '#/components/schemas/Io'
+        rules:
+          type: array
+          description: Decoded on-device rules.
+          items:
+            $ref: '#/components/schemas/Rule'
+        capabilities:
+          type: array
+          description: >
+            Platform-neutral **semantic capabilities** for each control. Each
+            is an abstract device role (`Switch`, `Lock`, `GarageDoor`, …) plus friendly names,
+            whether it needs a secondary verification to actuate (`secure`), its current abstract
+            state, and the abstract commands it accepts. Connector adapters (Home Assistant,
+            Alexa, Google) map `type` to their own entity/interface/trait; this stays neutral.
+          items:
+            $ref: '#/components/schemas/Capability'
+
+    Network:
+      type: [object, 'null']
+      properties:
+        carrier:
+          type: [string, 'null']
+        signal:
+          type: [number, 'null']
+        online:
+          type: boolean
+
+    Location:
+      type: [object, 'null']
+      properties:
+        lat:
+          type: number
+        lon:
+          type: number
+        place:
+          type: [string, 'null']
+
+    Io:
+      type: object
+      required: [io, state]
+      properties:
+        io:
+          type: integer
+          description: The IO number on the device.
+        type:
+          type: [integer, 'null']
+          description: Numeric device-type code.
+        typeName:
+          type: [string, 'null']
+          description: Human name for the type (e.g. "Digital Output", "Analog Input").
+        gpio:
+          type: [integer, 'null']
+          description: Physical GPIO pin, where applicable.
+        state:
+          $ref: '#/components/schemas/IoState'
+
+    Rule:
+      type: object
+      required: [ruleId, enabled]
+      properties:
+        ruleId:
+          type: integer
+        enabled:
+          type: boolean
+        type:
+          type: string
+          enum: [digital, analog, schedule]
+        frequencyMs:
+          type: integer
+        if:
+          type: object
+          additionalProperties: true
+          description: Decoded condition (shape depends on rule type).
+        then:
+          type: object
+          additionalProperties: true
+        else:
+          type: object
+          additionalProperties: true
+
+    CapabilityType:
+      type: string
+      description: >
+        The semantic capability taxonomy. Adapters map each type to their platform:
+        Home Assistant entity/`device_class`, Alexa interface/category, Google trait/type.
+      enum:
+        - Switch
+        - Light
+        - Lock
+        - GarageDoor
+        - Cover
+        - ContactSensor
+        - MotionSensor
+        - TemperatureSensor
+        - AnalogGauge
+        - Thermostat
+        - Dimmer
+        - FanSpeed
+
+    Capability:
+      type: object
+      description: >
+        One platform-neutral capability for a control, so the server and every adapter
+        agree on a single abstract shape.
+      required: [controlId, type, names, secure, state, commands]
+      properties:
+        controlId:
+          type: string
+          description: The `ui_controls._id` this capability was authored on.
+        type:
+          $ref: '#/components/schemas/CapabilityType'
+        names:
+          type: array
+          description: Friendly names + spoken keywords (Alexa utterances / Google nicknames).
+          items:
+            type: string
+        secure:
+          type: boolean
+          description: >
+            The actuation needs a secondary verification on voice platforms (Alexa voice code /
+            Google PIN). Auto-defaults true for `Lock` and `GarageDoor`.
+        state:
+          type: object
+          description: Current abstract state of the capability.
+          required: [value]
+          properties:
+            value:
+              description: e.g. "on"/"off", "locked"/"unlocked", "open"/"closed", or a number.
+              type: [string, number, boolean, 'null']
+        commands:
+          type: array
+          description: Abstract commands this capability accepts (e.g. "on"/"off", "open"/"close").
+          items:
+            type: string
+
+    Command:
+      description: A single actuation command. `type` discriminates the shape.
+      oneOf:
+        - $ref: '#/components/schemas/SetIoCommand'
+        - $ref: '#/components/schemas/PulseIoCommand'
+        - $ref: '#/components/schemas/SetRuleEnabledCommand'
+        - $ref: '#/components/schemas/CapabilityCommand'
+      discriminator:
+        propertyName: type
+        mapping:
+          set_io: '#/components/schemas/SetIoCommand'
+          pulse_io: '#/components/schemas/PulseIoCommand'
+          set_rule_enabled: '#/components/schemas/SetRuleEnabledCommand'
+          capability: '#/components/schemas/CapabilityCommand'
+
+    TimeoutMs:
+      type: integer
+      minimum: 1
+      maximum: 30000
+      description: >
+        If present, wait this many ms for a confirmed device reply (→ `200`); if the device does
+        not reply in time, `202 pending`. If absent, fire-and-forget (`202`).
+
+    SetIoCommand:
+      type: object
+      required: [type, io, state]
+      properties:
+        type:
+          const: set_io
+        io:
+          type: integer
+          description: The IO number to set.
+        state:
+          $ref: '#/components/schemas/IoState'
+        timeoutMs:
+          $ref: '#/components/schemas/TimeoutMs'
+      additionalProperties: false
+
+    PulseIoCommand:
+      type: object
+      required: [type, io, state, durationMs]
+      properties:
+        type:
+          const: pulse_io
+        io:
+          type: integer
+        state:
+          $ref: '#/components/schemas/IoState'
+        durationMs:
+          type: integer
+          minimum: 1
+          description: How long to hold `state` before reverting.
+        revertState:
+          $ref: '#/components/schemas/IoState'
+        timeoutMs:
+          $ref: '#/components/schemas/TimeoutMs'
+      additionalProperties: false
+
+    SetRuleEnabledCommand:
+      type: object
+      required: [type, ruleId, enabled]
+      properties:
+        type:
+          const: set_rule_enabled
+        ruleId:
+          type: integer
+        enabled:
+          type: boolean
+        timeoutMs:
+          $ref: '#/components/schemas/TimeoutMs'
+      additionalProperties: false
+
+    CapabilityCommand:
+      type: object
+      description: >
+        Actuate a capability by its abstract command (e.g. "open"/"close", "on"/"off",
+        "lock"/"unlock") — the platform-neutral path connector adapters use. The server resolves
+        `controlId` + `command` to the authored IO action; the caller needs no IO knowledge.
+      required: [type, controlId, command]
+      properties:
+        type:
+          const: capability
+        controlId:
+          type: string
+          description: The capability's `controlId` (from the device's `capabilities[]`).
+        command:
+          type: string
+          description: One of the capability's advertised `commands` (e.g. "open").
+        timeoutMs:
+          $ref: '#/components/schemas/TimeoutMs'
+      additionalProperties: false
+
+    AppliedAction:
+      type: object
+      properties:
+        io:
+          type: integer
+        state:
+          $ref: '#/components/schemas/IoState'
+        ruleId:
+          type: integer
+        enabled:
+          type: boolean
+        controlId:
+          type: string
+        command:
+          type: string
+
+    CommandConfirmed:
+      type: object
+      required: [status, serialNumber, at]
+      properties:
+        status:
+          const: confirmed
+        serialNumber:
+          type: string
+          description: The device's serial (its public identifier).
+        applied:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppliedAction'
+        at:
+          type: string
+          format: date-time
+
+    CommandPending:
+      type: object
+      required: [status, serialNumber]
+      properties:
+        status:
+          const: pending
+        serialNumber:
+          type: string
+          description: The device's serial (its public identifier).
+        note:
+          type: string
+
+    EventType:
+      type: string
+      enum:
+        - io_state_change
+        - rule_change
+        - command_reply
+        - device_online
+        - device_offline
+
+    Event:
+      type: object
+      required: [type, at]
+      properties:
+        type:
+          $ref: '#/components/schemas/EventType'
+        at:
+          type: string
+          format: date-time
+        io:
+          type: integer
+          description: Present on `io_state_change`.
+        state:
+          $ref: '#/components/schemas/IoState'
+        ruleId:
+          type: integer
+          description: Present on `rule_change`.
+        data:
+          type: object
+          additionalProperties: true
+          description: Type-specific payload (e.g. the result of a `command_reply`).
+
+    WebhookCreate:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS endpoint that will receive signed deliveries.
+        events:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventType'
+        serialNumber:
+          type: string
+          description: Scope to one device by its serial. Omit for all of the account's devices.
+      additionalProperties: false
+
+    Webhook:
+      type: object
+      required: [id, url, events, createdAt]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventType'
+        serialNumber:
+          type: [string, 'null']
+          description: The serial of the device this subscription is scoped to, or `null` for all devices.
+        active:
+          type: boolean
+          description: Whether the subscription is currently delivering. Disabled subscriptions stay listed but do not fire.
+        createdAt:
+          type: string
+          format: date-time
+
+    WebhookCreated:
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: >
+                HMAC signing secret, shown **only** in this create response. Deliveries are signed
+                `X-Justworx-Signature: sha256=<HMAC-SHA256(secret, rawBody)>`.
+
+    WebhookDelivery:
+      description: >
+        The body Justworx POSTs to a registered webhook URL (documented here for integrators; not
+        an endpoint of this API).
+      type: object
+      required: [event, serialNumber, data, at]
+      properties:
+        event:
+          $ref: '#/components/schemas/EventType'
+        serialNumber:
+          type: string
+          description: The device's serial number — its public identifier.
+        data:
+          type: object
+          additionalProperties: true
+        at:
+          type: string
+          format: date-time
