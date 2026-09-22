@@ -1,10 +1,10 @@
-# Justworx Developer API — OpenAPI specification
+# Justworx API — OpenAPI specification
 
-The canonical OpenAPI 3.1 contract for the **Justworx Developer API**: list devices, read live state,
-send commands, and subscribe to events.
+The canonical OpenAPI 3.1 contract for the **Justworx API**: list devices, read live state, send
+commands, and subscribe to events (WebSocket or long-poll).
 
-- **Spec:** [`openapi.yaml`](openapi.yaml)
-- **Base URL:** `https://dev-api.justworx.com/api/dev/v1`
-- **SDK:** `@justworxcloud/sdk` (npm)
+- **Spec:** [`openapi/v2.yaml`](openapi/v2.yaml)
+- **Base URL:** `https://api.justworx.com/api/v2`
+- **Version:** 2.5.0
 
-Import `openapi.yaml` into Postman, Swagger UI, or any OpenAPI tool, or use it to generate a client.
+Import `openapi/v2.yaml` into Postman, Swagger UI, or any OpenAPI tool, or use it to generate a client.
