@@ -1318,6 +1318,7 @@ paths:
                 referenceMv: 3300
                 maxVoltage: 3.3
                 name: Battery Voltage
+                capability: null
                 stateKeywords: null
                 states:
                   - when:
@@ -5055,6 +5056,35 @@ components:
                 The name in force: yours if you have set one, the product author's otherwise, and
                 `null` where neither exists or where you cleared yours deliberately. Set it on a
                 create or a metadata write.
+            capability:
+              type:
+                - object
+                - 'null'
+              description: >
+                What this ID *means*, as authored on the product template — the layer that lets a
+                control platform or an app present it as a garage door rather than as pin 11. Null
+                where the author has not given the ID a capability.
+              properties:
+                type:
+                  type:
+                    - string
+                    - 'null'
+                  description: >
+                    One of `Switch`, `Light`, `Lock`, `GarageDoor`, `Cover`, `ContactSensor`,
+                    `MotionSensor`, `TemperatureSensor`, `AnalogGauge`.
+                names:
+                  type: array
+                  items:
+                    type: string
+                  description: >
+                    Friendly names and spoken keywords, most-preferred first. **Use `names[0]` as
+                    the label** rather than inventing one — it is what the author called this
+                    control.
+                secure:
+                  type: boolean
+                  description: >
+                    The platform requires a second confirmation before actuating. Defaults true for
+                    `Lock` and `GarageDoor`.
             stateKeywords:
               type:
                 - object
@@ -5453,6 +5483,30 @@ components:
         type:
           type: string
           const: getRules
+    RefreshIdAction:
+      type: object
+      description: >
+        Ask the device to report one ID's value right now, on the rule's own timing, rather than
+        waiting for that ID's own update interval or self-update trigger. Useful for an ID that does
+        not self-update often (a long `updateMs`, or `updateMode: onChange`) that you want reported
+        the instant a DIFFERENT condition fires — an analog reading you want the moment a digital
+        sensor crosses a threshold, for instance.
+
+
+        Safe for the same reason `getRules` is: it changes nothing about the ruleset or the ID's own
+        configuration, so it cannot produce the self-modifying-ruleset problem the three excluded
+        rule actions exist to avoid. Distinct from `addTelemetry`: this is a one-shot read fired by
+        a condition, not a standing scheduled sampler.
+      required:
+        - type
+        - idNumber
+      properties:
+        type:
+          type: string
+          const: refreshId
+        idNumber:
+          type: integer
+          description: The ID to report right now.
     CreateIdAction:
       type: object
       description: >
@@ -5615,6 +5669,7 @@ components:
         - $ref: '#/components/schemas/EnableRuleAction'
         - $ref: '#/components/schemas/DisableRuleAction'
         - $ref: '#/components/schemas/GetRulesAction'
+        - $ref: '#/components/schemas/RefreshIdAction'
         - $ref: '#/components/schemas/CreateIdAction'
         - $ref: '#/components/schemas/DeleteIdAction'
         - $ref: '#/components/schemas/ClearIdsAction'
@@ -5632,6 +5687,7 @@ components:
           enableRule: '#/components/schemas/EnableRuleAction'
           disableRule: '#/components/schemas/DisableRuleAction'
           getRules: '#/components/schemas/GetRulesAction'
+          refreshId: '#/components/schemas/RefreshIdAction'
           createId: '#/components/schemas/CreateIdAction'
           deleteId: '#/components/schemas/DeleteIdAction'
           clearIds: '#/components/schemas/ClearIdsAction'
@@ -5732,21 +5788,45 @@ components:
     ScheduleCondition:
       type: object
       description: >
-        Fires on time rather than on a sensor. **All three constraints apply together:** the rule is
-        active only within the date range, only within the daily time window, and only on the listed
-        days. Outside them the rule stays loaded on the device but never fires.
+        Fires on time rather than on a sensor. **All three constraints apply together:** the date
+        range, the daily time window and the listed days.
+
+
+        **How it fires depends on the device firmware.** From **8.13.0**, `then` fires **once, at
+        `startTime`**, and the optional `thenAtEnd` fires once at `endTime` -- so "light on 10:00,
+        off 11:00" is one rule. A start or end fires only if the device saw it happen: one check is
+        needed to arm the rule after it is created, enabled or the device reboots, so a boundary in
+        that first interval is skipped, and one missed while the device was off is never caught up.
+        An end still fires if its start was missed. A window shorter than `runIntervalMs` fires
+        start and end in the same check. **Below 8.13.0**, `then` fires on every check inside the
+        window and nothing happens at the end.
+
+
+        **Times, days and dates are the device's LOCAL time.** The device's clock runs on UTC, so
+        the platform converts the schedule using the timezone of the device's location before
+        sending it, and `GET /devices/{serial}/rules` returns what you wrote. A device whose
+        location is not yet known is sent the times unconverted, so they run as UTC. Daylight-saving
+        changes are not re-applied: the offset is the one in force when the rule is created. A
+        window that crosses midnight UTC once converted (for example 01:00–03:00 in South Africa)
+        needs device firmware 8.12.5 or later, and is refused with `422 UNPROCESSABLE` on older
+        firmware rather than accepted and never fired.
       required:
         - startTime
-        - endTime
       properties:
         startTime:
           type: string
-          description: Daily window start, `HH:MM:SS`.
+          description: Daily window start, `HH:MM:SS`, device local time. Hours 00–23.
           example: '18:00:00'
         endTime:
-          type: string
-          description: Daily window end, `HH:MM:SS`.
+          type:
+            - string
+            - 'null'
           example: '22:30:00'
+          description: >
+            Daily window end, `HH:MM:SS`, device local time. Hours 00–23. Required with `thenAtEnd`.
+            **Omit it for a rule that only acts at its start** (firmware 8.13.0 or later; refused
+            with `422 UNPROCESSABLE` below that, where the window end is what stops the repeated
+            firing).
         daysOfWeek:
           type: array
           minItems: 1
@@ -5866,6 +5946,15 @@ components:
               const: schedule
             if:
               $ref: '#/components/schemas/ScheduleCondition'
+            thenAtEnd:
+              description: >
+                Optional action fired once at `if.endTime`, in the same vocabulary as `then`. Needs
+                `if.endTime` and device firmware 8.13.0 or later -- refused with `422 UNPROCESSABLE`
+                below that, where it would fire together with the start action on every check. A
+                window that crosses midnight fires its end on the following day.
+              oneOf:
+                - $ref: '#/components/schemas/Action'
+                - type: 'null'
         - $ref: '#/components/schemas/RuleCommon'
     RuleCreateEnvelope:
       type: object
@@ -5948,6 +6037,11 @@ components:
               description: The condition, in the shape its type defines.
             then:
               $ref: '#/components/schemas/Action'
+            thenAtEnd:
+              description: A schedule rule's end action, or null when it has none.
+              oneOf:
+                - $ref: '#/components/schemas/Action'
+                - type: 'null'
     RuleConfigured:
       allOf:
         - $ref: '#/components/schemas/Confirmed'
@@ -6000,7 +6094,7 @@ components:
 openapi: 3.1.0
 info:
   title: Justworx API
-  version: 2.5.0
+  version: 2.6.0
   summary: Control and read Justworx devices.
   description: >
     One API for everything that touches a Justworx device — the same one our own apps use.
