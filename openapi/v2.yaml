@@ -9,14 +9,13 @@ paths:
         Sets the name that appears in event sentences -- "Wayne opened the Main Gate".
 
 
-        **Every user must have a name.** It is required at registration, and this route will not
-        remove one: `null` is refused, and so are an empty string and whitespace. A name can be
-        changed, never cleared.
+        **A name can be set and changed, never cleared.** `null` is refused, and so are an empty
+        string and whitespace; the name is trimmed before it is checked.
 
 
-        Where a user somehow has no name -- a record predating the rule, an import, corruption --
-        event sentences fall back to their **email address** rather than to an anonymous label,
-        because the email still identifies the person.
+        A new account starts with no name. Until one is set, event sentences name the person by
+        their **email address** rather than an anonymous label, because the email still identifies
+        them.
       security:
         - apiKey: []
         - oauth2: []
@@ -32,7 +31,7 @@ paths:
                 displayName:
                   type: string
                   minLength: 1
-                  maxLength: 60
+                  maxLength: 40
                   description: >
                     Rendered inside a sentence in other people's feeds on a shared device, so
                     control characters and newlines are refused.
@@ -46,9 +45,13 @@ paths:
               schema:
                 type: object
                 properties:
+                  id:
+                    type: string
+                    description: Your user id.
                   displayName:
                     type: string
               example:
+                id: 6f1c2e0a-8b7d-4c1e-9a55-0d3b2f7e9c41
                 displayName: Wayne
         '400':
           description: |
@@ -64,6 +67,15 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The credential belongs to no user account (an API key held by a service).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: NOT_FOUND
+                detail: no such user
         '500':
           $ref: '#/components/responses/ServerError'
     get:
@@ -136,8 +148,16 @@ paths:
       summary: Apply a template to a device
       description: >
         Sends the commands that make the device's IDs and rules match the template, and updates its
-        UI design to match. To move a device between versions of the template it already came from,
-        use `POST /devices/{serial}/config` instead — that call knows which version it shipped with.
+        UI design to match. The template must be your own (in any status) or a public one; someone
+        else's private template answers `404`, as if it did not exist. To move a device between
+        versions of the template it already came from, use `POST /devices/{serial}/config` instead —
+        that call knows which version it shipped with.
+
+        **Only what differs is sent, and nothing is recorded until the device accepts it.** Each ID
+        and rule the device already holds exactly is skipped. The deploy -- when it happened, which
+        template version, and the UI design -- is recorded only once the device has acknowledged
+        every command; if it already held everything, nothing is sent and the deploy is recorded at
+        once (`200 status: unchanged`). An offline device is refused with `409`.
       security:
         - apiKey:
             - devices:configure
@@ -160,14 +180,58 @@ paths:
                     - integer
                     - 'null'
                   description: Omit for the newest published version.
-                timeoutMs:
-                  $ref: '#/components/schemas/TimeoutMs'
                 requestId:
                   $ref: '#/components/schemas/RequestId'
             example:
               templateId: tpl_7f31
               version: 5
       responses:
+        '200':
+          description: Unchanged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - serial
+                  - commands
+                  - deploy
+                properties:
+                  status:
+                    type: string
+                    const: unchanged
+                  serial:
+                    type: string
+                  templateId:
+                    type: string
+                  templateVersion:
+                    type:
+                      - integer
+                      - 'null'
+                  commands:
+                    type: integer
+                    const: 0
+                  deploy:
+                    type: object
+                    description: The deploy, recorded now -- the device already held everything.
+                    properties:
+                      lastDeployedAt:
+                        type: string
+                        format: date-time
+                      templateVersion:
+                        type:
+                          - integer
+                          - 'null'
+              example:
+                status: unchanged
+                serial: ABCD1234
+                templateId: tpl_7f31
+                templateVersion: 5
+                commands: 0
+                deploy:
+                  lastDeployedAt: '2026-09-18T09:42:03.000Z'
+                  templateVersion: 5
         '202':
           description: Sent.
           content:
@@ -185,26 +249,13 @@ paths:
                           - 'null'
                       commands:
                         type: integer
-                        description: How many frames were sent to the device.
-                      deploy:
-                        type: object
-                        properties:
-                          lastDeployedAt:
-                            type: string
-                            format: date-time
-                          templateVersion:
-                            type:
-                              - integer
-                              - 'null'
+                        description: How many commands were sent -- only those that differ from the device.
               example:
                 status: sent
                 serial: ABCD1234
                 templateId: tpl_7f31
                 templateVersion: 5
                 commands: 12
-                deploy:
-                  lastDeployedAt: '2026-09-18T09:42:03.000Z'
-                  templateVersion: 5
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -392,6 +443,9 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 120
+                  description: >
+                    Leading and trailing spaces are trimmed. Blank after trimming, or longer than
+                    120, is refused. **Owner only** — a device shared with you answers `404`.
             example:
               name: Main Gate Controller
       responses:
@@ -425,19 +479,28 @@ paths:
       tags:
         - Devices
       summary: Restart a device
-      description: |
+      description: >
         Restarts the device immediately.
 
+
         > **This is the one call that never waits.** The device restarts the moment it receives the
+
         > command, so there is nothing left to answer with — and rather than leave that to the
+
         > caller, the route does not accept `timeoutMs` at all and always answers `202`. You cannot
+
         > ask this call to confirm, and you cannot accidentally make it hang.
 
+
         IDs and rules survive a reboot; they are stored on the device. A reboot does not reset
+
         configuration — for that, remove the IDs or clear the rules.
 
-        The device typically reappears within 30–60 seconds. Watch for it by polling any call until
-        it stops answering `DEVICE_OFFLINE`.
+
+        The device typically reappears within 30–60 seconds. Watch for it by reading
+
+        `GET /devices/{serial}` until `online` is `true` again — reads never answer
+        `DEVICE_OFFLINE`.
       security:
         - apiKey:
             - devices:command
@@ -520,12 +583,12 @@ paths:
                 allOf:
                   - $ref: '#/components/schemas/Confirmed'
                   - type: object
-                    required:
-                      - cancelled
                     properties:
                       cancelled:
                         type: integer
-                        description: How many timers were cancelled.
+                        description: >
+                          How many timers were cancelled, as the device reported it. Absent when the
+                          device's reply could not be read as a count -- never guessed.
               example:
                 status: confirmed
                 serial: ABCD1234
@@ -560,24 +623,43 @@ paths:
       tags:
         - Devices
       summary: A device's history, newest first
-      description: |
-        Every message between the platform and a device is recorded — commands sent, replies
-        received, values reported, connections lost and regained. **The log is the record of what
+      description: >
+        What happened on a device, as the platform recorded it — requests made, what the device
+
+        confirmed, values reported, connections lost and regained. Not every message: only the kinds
+
+        listed under `LogEntryType` are recorded, and a value is recorded when it changes, not every
+
+        time the device repeats it. **The log is the record of what
+
         actually happened, where the twin is only the record of where things ended up.**
 
+
         Reach for it when the twin alone does not answer the question: why a value changed when
+
         nobody asked it to, whether a command was really delivered, how long a device has been
+
         dropping in and out, what it was doing before it went offline.
 
+
         Like the twin this reads stored data — no command is sent, no airtime is used, and it works
+
         for an offline device.
 
-        **Entries are kept for 365 days**, then archived on a per-day FIFO basis automatically.
 
-        **Correlating with your own requests.** Entries created by something you sent carry the
-        `requestId` you used, so you can follow a single action all the way through. Entries the
-        device raised on its own have **no** `requestId`, which is itself informative: if a value
-        changed and the log shows no `requestId` against it, nothing you sent caused it.
+        **Correlating with your own requests.** The `action` entry for something you sent carries
+        the
+
+        `requestId` you used. The device's own confirming entry (`value_written`, `id_configured`
+
+        and the like) does **not** carry it — so a device entry without a `requestId` does not mean
+
+        nobody asked. Match the two by time and ID, or read the `actor`.
+
+
+        **On a shared device** you see activity only if the share grants it: `viewLogs: all` sees
+
+        everything, `own` only your own actions, and a share without it gets `403`.
       security:
         - apiKey:
             - events:read
@@ -839,7 +921,7 @@ paths:
                     message: null
                     actor: null
                     channel: log
-                    data: '{}'
+                    data: {}
                 cursor: MjAyNi0wOS0xOFQwOToxMjowOC4wMDBafGxvZ18wMDQ1
                 hasMore: false
         '400':
@@ -862,10 +944,12 @@ paths:
         The effective event settings for one device: what the product decided, and any override you
         have applied on top. Owner only — a share, even with full control, does not reach this.
 
-        > **This is not where an IO's notifications come from.** Those are the `states` list on the
-        > ID — a comparison, a `sentence`, and whether it logs, pushes or both. This surface covers
-        > the events that belong to no IO: configuration events, and the device coming online and
-        > going offline.
+        > **This is not where an IO's sentences come from.** Those are the `states` list on the ID —
+        > a comparison, a `sentence`, and whether it logs, pushes or both. This surface holds the
+        > product's event catalog: the events that belong to no IO (configuration events, the device
+        > coming online and going offline), and the per-IO entries the product defines. **For an ID
+        > that has `states`, an override here can switch its events off (`enabled: false`) but its
+        > `channel` has no effect** — the ID's own `states` decide that.
 
         Each entry carries the resolved values, a `productDefault` so a client can offer "reset to
         the product default", `overridden` naming the fields you have changed, and
@@ -964,7 +1048,6 @@ paths:
               example:
                 error: INVALID_FIELDS
                 detail: 'value_reported#39.verb is not an overridable field. Allowed: enabled, channel'
-                serial: ABCD1234
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -978,7 +1061,6 @@ paths:
               example:
                 error: NOT_FOUND
                 detail: No device with that serial, or you are not its owner.
-                serial: ABCD1234
         '500':
           $ref: '#/components/responses/ServerError'
   /devices/{serial}/ids:
@@ -1057,20 +1139,37 @@ paths:
       tags:
         - IDs
       summary: Create or replace an ID
-      description: |
+      description: >
         **Start here. Nothing else in this API works until IDs are configured.**
 
+
         A device's ID list *is* its configuration. Each ID either sets up one of the device's
+
         physical pins — what it is, how it behaves, how often it reports, how it times — or defines
+
         a value the device stores or computes on its own. A pin with no ID against it does nothing
+
         and cannot be read or driven.
+
 
         Creating an ID **configures** the device. It does not read a value or change one.
 
+
         **Re-using an existing `idNumber` replaces that ID's configuration**, so this is create and
+
         replace in one call.
 
+
+        **Only a change is sent.** If the device already holds exactly this configuration, nothing
+        is
+
+        sent and the answer is `200 status: unchanged`. A name, states or link in the same body are
+
+        still saved. Anything this call changes is recorded only once the device has accepted it.
+
+
         A freshly manufactured device is already configured from its product template, so in normal
+
         use you are adding to that rather than starting from nothing.
       security:
         - apiKey:
@@ -1174,19 +1273,20 @@ paths:
                   updateMs: 1000
       responses:
         '200':
-          description: The device confirmed. The body echoes the configuration it accepted.
+          description: Confirmed, saved (metadata only), or unchanged.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IdConfigured'
+                oneOf:
+                  - $ref: '#/components/schemas/IdConfigured'
+                  - $ref: '#/components/schemas/Saved'
+                  - $ref: '#/components/schemas/Unchanged'
               example:
                 status: confirmed
                 serial: ABCD1234
                 requestId: cfg-gate-relay
                 idNumber: 1
                 type: digitalOutput
-                pin: 10
-                bootState: low
                 result: ok
                 at: '2026-08-12T14:03:11.200Z'
         '202':
@@ -1329,7 +1429,7 @@ paths:
                     alert: true
                 showActor: false
                 linkedIo: null
-                value: 2204
+                value: 2.2
                 at: '2026-09-18T09:41:50.000Z'
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -1343,6 +1443,8 @@ paths:
           $ref: '#/components/responses/ServerError'
         '502':
           $ref: '#/components/responses/BadGateway'
+        '504':
+          $ref: '#/components/responses/DeviceTimeout'
     delete:
       operationId: deleteId
       tags:
@@ -1424,7 +1526,8 @@ paths:
         **To read several IDs, read the twin** — `GET /devices/{serial}` returns every configured ID
         and its value in one call, which is both fewer requests and the recommended path.
 
-        The device samples the pin fresh on every call. An analog ID's value comes back in its
+        The device answers with the value it holds; it does not sample the pin again for this call.
+        An analog ID's value comes back in its
         real-world units, derived from its `referenceMv` and `maxVoltage`. An ID with neither is
         uncalibrated and reports raw millivolts.
       security:
@@ -1479,7 +1582,8 @@ paths:
         for your use case. Reconfigure it rather than working around it on every call.
 
         **On a `200`, `value` is the state the device reports *after* the write — its real state,
-        not an echo of what you asked for.** Compare the two if you need to be certain the hardware
+        not an echo of what you asked for** — and `null` when the device's reply did not include
+        this ID. Compare the two if you need to be certain the hardware
         did what you intended.
       security:
         - apiKey:
@@ -1502,8 +1606,9 @@ paths:
                     - string
                   description: >
                     The value to write. Digital IDs take `"high"` or `"low"`; `analogInput` takes a
-                    number; `textVariable` takes a string. Ignored on `momentaryOutput` and
-                    `delayedOutput`, where any write fires the configured behaviour.
+                    number; `textVariable` takes a string, sent exactly as written (it may not
+                    contain a comma or `*`). Ignored on `momentaryOutput` and `delayedOutput`, where
+                    any write fires the configured behaviour.
                 force:
                   type: boolean
                   default: false
@@ -2078,9 +2183,14 @@ paths:
         > poor fix.** Absence of a position is not the same as a position of zero.
 
 
-        **The `200` returns the values *as applied*, after any clamping** — worth reading rather
+        **The `200` returns the values the device reports it applied**, after its own clamping —
 
-        than assuming your request went through unchanged.
+        worth reading rather than assuming your request went through unchanged. Like every other
+
+        device write it waits for the device (`timeoutMs`), answers `504` if the device stays
+        silent,
+
+        and saves nothing the device has not accepted. **Owner only.**
       security:
         - apiKey:
             - devices:configure
@@ -2100,12 +2210,11 @@ paths:
                   description: '`true` starts publishing position updates; `false` stops them.'
                 intervalSeconds:
                   type: integer
-                  minimum: 1
-                  maximum: 65535
                   default: 10
                   description: >
-                    How often a fresh position is read and published. Values at or below zero fall
-                    back to the default.
+                    How often a fresh position is read and published, 1 to 65535 -- a value above
+                    65535 is clamped to it, not refused. Values at or below zero fall back to the
+                    default.
                 timeoutMs:
                   $ref: '#/components/schemas/TimeoutMs'
                 requestId:
@@ -2131,6 +2240,12 @@ paths:
                 enabled: true
                 intervalSeconds: 10
                 at: '2026-08-13T22:04:11.000Z'
+        '202':
+          description: Sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sent'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -2143,28 +2258,56 @@ paths:
           $ref: '#/components/responses/DeviceOffline'
         '500':
           $ref: '#/components/responses/ServerError'
+        '504':
+          $ref: '#/components/responses/DeviceTimeout'
   /devices/claim:
     post:
       operationId: claimDevice
       tags:
         - Ownership
       summary: Take ownership of a device
-      description: |
+      description: >
         A device is manufactured, configured in the factory from its product template, and sold.
+
         **Claiming is how it becomes someone's.**
 
+
         > **User token only.** An API key is refused. Claiming decides who controls physical
+
         > hardware, so it must be an act by an identified person.
 
+
         The device is **already configured** — the factory set it up from its product template.
+
         **Claiming sends it no commands.** What it does instead is **compare** the device against
+
         that template and tell you whether they still match. If they do not, the response says so
+
         and offers to bring it up to date, leaving the choice with the new owner rather than
+
         silently rewriting a device that may have been deliberately customised.
 
-        The comparison is on **ID numbers, types and type parameters, and on rules**. **State is
-        never compared** — wiring, power and physical reality decide what a pin reads at boot, and
-        no template can promise that.
+
+        What is compared, and nothing more:
+
+        **IDs** — whether each template ID is configured on the device (`missing`), whether the
+        device
+
+        has IDs the template does not (`unexpected`), and, where both have it, its **type and pin**
+
+        (`changed`). Other type parameters — boot state, timings, calibration — are not compared.
+
+        **Rules** — only whether each template rule number exists on the device (`missing`); a
+        rule's
+
+        content is not compared, and rules the template does not have are not reported. Rules are
+
+        not compared at all while the device has reported no rule table. **State is never
+
+        compared.** The template is the one stored now; there is no version history to compare a
+
+        device against the version it was built from.
+
 
         Only Justworx hardware can be claimed, and only if it is in stock and unclaimed.
       security:
@@ -2221,7 +2364,6 @@ paths:
               example:
                 error: FORBIDDEN
                 detail: Claiming a device requires a user token. An API key cannot claim.
-                serial: ABCD1234
         '404':
           description: No such serial in stock.
           content:
@@ -2253,13 +2395,19 @@ paths:
         - Ownership
       summary: Compare a device against its template
       description: >
-        The same comparison claiming performs, on demand. Returns what the device is configured to
-        do and whether it still matches the template version it was built from, including
-        `originalTemplateVersion` — the version it **shipped** with.
+        The same comparison claiming performs, on demand, against the device's template as it is
+        stored now. The response also carries `originalTemplateVersion` — the version the device
+        **shipped** with.
 
 
-        Compared on ID numbers, types and type parameters, and on rules. **State is never
-        compared.**
+        What is compared, and nothing more: **IDs** — whether each template ID is configured on the
+        device (`missing`), whether the device has IDs the template does not (`unexpected`), and,
+        where both have it, its **type and pin** (`changed`). Other type parameters — boot state,
+        timings, calibration — are not compared. **Rules** — only whether each template rule number
+        exists on the device (`missing`); a rule's content is not compared, and rules the template
+        does not have are not reported. Rules are not compared at all while the device has reported
+        no rule table. **State is never compared.** The template is the one stored now; there is no
+        version history to compare a device against the version it was built from.
       security:
         - apiKey:
             - devices:read
@@ -2301,6 +2449,12 @@ paths:
         updates its UI design to match too**. Configuration and design move together; a device
         brought up to date gets both.
 
+        **Only what differs is sent, and nothing is recorded until the device accepts it.** Each ID
+        and rule the device already holds exactly is skipped. The deploy -- when it happened, which
+        template version, and the UI design -- is recorded only once the device has acknowledged
+        every command; if it already held everything, nothing is sent and the deploy is recorded at
+        once (`200 status: unchanged`). An offline device is refused with `409`.
+
         > **`reset` restores the version the device *originally shipped with*, not the newest one.**
         > Moving to a newer version is a separate, deliberate act. "Put it back how it was" and
         > "give me the latest" are different intentions and are never the same call.
@@ -2332,14 +2486,55 @@ paths:
                     - integer
                     - 'null'
                   description: For `upgrade`. Omit for the newest.
-                timeoutMs:
-                  $ref: '#/components/schemas/TimeoutMs'
                 requestId:
                   $ref: '#/components/schemas/RequestId'
             example:
               mode: upgrade
               targetVersion: 5
       responses:
+        '200':
+          description: Unchanged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - serial
+                  - commands
+                  - deploy
+                properties:
+                  status:
+                    type: string
+                    const: unchanged
+                  serial:
+                    type: string
+                  templateVersion:
+                    type:
+                      - integer
+                      - 'null'
+                  commands:
+                    type: integer
+                    const: 0
+                  deploy:
+                    type: object
+                    description: The deploy, recorded now -- the device already held everything.
+                    properties:
+                      lastDeployedAt:
+                        type: string
+                        format: date-time
+                      templateVersion:
+                        type:
+                          - integer
+                          - 'null'
+              example:
+                status: unchanged
+                serial: ABCD1234
+                templateVersion: 5
+                commands: 0
+                deploy:
+                  lastDeployedAt: '2026-09-18T09:42:03.000Z'
+                  templateVersion: 5
         '202':
           description: Sent.
           content:
@@ -2355,25 +2550,12 @@ paths:
                           - 'null'
                       commands:
                         type: integer
-                        description: How many frames were sent to the device.
-                      deploy:
-                        type: object
-                        properties:
-                          lastDeployedAt:
-                            type: string
-                            format: date-time
-                          templateVersion:
-                            type:
-                              - integer
-                              - 'null'
+                        description: How many commands were sent -- only those that differ from the device.
               example:
                 status: sent
                 serial: ABCD1234
                 templateVersion: 5
                 commands: 12
-                deploy:
-                  lastDeployedAt: '2026-09-18T09:42:03.000Z'
-                  templateVersion: 5
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -2494,7 +2676,11 @@ paths:
         · Rules act on **IDs**, not raw pins. The ID must already exist on the device.
 
 
-        **Re-using a `ruleNumber` replaces that rule.**
+        **Re-using a `ruleNumber` replaces that rule.** If the device already holds exactly this
+
+        rule, nothing is sent and the answer is `200 status: unchanged`; a changed `name` alone is
+
+        still saved. The rule is recorded only once the device has accepted it.
       security:
         - apiKey:
             - devices:configure
@@ -2596,11 +2782,14 @@ paths:
                     state: high
       responses:
         '200':
-          description: The device confirmed.
+          description: The device confirmed, or already held exactly this and nothing was sent.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RuleConfigured'
+                oneOf:
+                  - $ref: '#/components/schemas/RuleConfigured'
+                  - $ref: '#/components/schemas/Saved'
+                  - $ref: '#/components/schemas/Unchanged'
               example:
                 status: confirmed
                 serial: ABCD1234
@@ -2625,6 +2814,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/DeviceOffline'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
         '500':
           $ref: '#/components/responses/ServerError'
         '504':
@@ -2635,8 +2826,8 @@ paths:
         - Rules
       summary: Remove every rule
       description: >
-        **Destructive.** Removes every rule on the device. Its IDs remain configured, but nothing
-        acts on them any more — the device becomes entirely passive until it is told what to do.
+        **Destructive.** Removes every rule on the device. Its IDs remain configured; interrupt IDs
+        still fire their own triggers and telemetry keeps sampling, but no rule acts on anything.
         Requires `confirm: true`.
       security:
         - apiKey:
@@ -3021,8 +3212,9 @@ paths:
         - Telemetry
       summary: Stop sampling
       description: >
-        Removes the telemetry configuration. A configuration that does not exist is a `404` — not a
-        `200` reporting that nothing was found.
+        Removes the telemetry configuration. When you wait for the device, a configuration it does
+        not have is a `404` — not a `200` reporting that nothing was found. The device is the one
+        that knows, so with `timeoutMs: 0` the answer is `202` either way.
       security:
         - apiKey:
             - devices:configure
@@ -3123,11 +3315,13 @@ components:
       name: serial
       in: path
       required: true
-      description: The device's serial — the number printed on the unit.
+      description: >
+        The device's serial — the number printed on the unit. Exactly 8 letters and digits; letters
+        are case-insensitive (the serial is upper-cased before use, so `abcd1234` is `ABCD1234`).
+        Anything else is refused with `400` before the device is looked up.
       schema:
         type: string
-        minLength: 1
-        maxLength: 64
+        pattern: ^[A-Za-z0-9]{8}$
       example: ABCD1234
     IdNumber:
       name: idNumber
@@ -3176,10 +3370,15 @@ components:
         (`INVALID_FIELDS` — including a `timeoutMs` that is neither `0` nor between 1 and 30000).
 
 
-        **Bodies are closed.** A property this contract does not describe is rejected by name before
-        any handler runs, so a typo in a field name is a `400`, never a silently ignored field. The
-        same applies to query parameters. This is enforced from the published document itself, which
-        is why a field absent from here is a field the API cannot accept.
+        **Bodies are closed at the top level.** A top-level property this contract does not describe
+        is rejected by name before any handler runs, so a typo in a field name is a `400`, never a
+        silently ignored field. The same applies to query parameters. Objects nested inside a body
+        (a rule's `if` and `then`, a share's `controlLevel`) are checked by their route, which
+        refuses what it cannot use.
+
+
+        This check runs **before** the credential is checked, so a malformed request is a `400` even
+        when the credential is also missing.
       content:
         application/json:
           schema:
@@ -3189,10 +3388,10 @@ components:
             detail: >-
               unknown parameter 'nmae' in the request body for PATCH /devices/{serial}. Accepted:
               name.
-            serial: ABCD1234
-            requestId: rename-gate
     Unauthorized:
-      description: Missing, malformed or expired token.
+      description: >
+        Missing, malformed or expired token. A fault on our side while checking the credential is
+        also reported as `401`.
       content:
         application/json:
           schema:
@@ -3265,18 +3464,15 @@ components:
             requestId: cfg-door-sensor
     BadGateway:
       description: >
-        The device answered, and its reply could not be read. Distinct from `504`, where it never
-        answered at all: here the command almost certainly ran, so **do not blindly retry** a write
-        that is not safe to repeat. Read the state back instead.
+        The device answered a read, and its reply could not be read. Distinct from `504`, where it
+        never answered at all. Only the single-ID reads return this; retrying them is safe.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           example:
             error: DEVICE_REPLY_MALFORMED
-            detail: The device answered and its reply could not be read. The command probably ran.
-            serial: ABCD1234
-            requestId: cfg-door-sensor
+            detail: The device answered and its reply could not be read.
     DeviceOffline:
       description: >
         The device is already known to be offline, so nothing was sent. This is a fast fail, not a
@@ -3295,7 +3491,9 @@ components:
     DeviceTimeout:
       description: >
         The device did not answer within `timeoutMs`. **The command was discarded, not queued** — it
-        will not run later when the device reconnects. Nothing was applied and nothing is pending.
+        will not run later when the device reconnects, and nothing it would have changed was saved.
+        If nothing else has been heard from the device since the command went out, it is also marked
+        offline, so the next call to it fails fast with `409 DEVICE_OFFLINE`.
       content:
         application/json:
           schema:
@@ -3330,7 +3528,6 @@ components:
             - TOO_MANY_REQUESTS
             - MISSING_FIELDS
             - INVALID_FIELDS
-            - INVALID_SERIAL
             - FORBIDDEN_EVENT
             - ID_NOT_CONFIGURED
             - CONFIRM_REQUIRED
@@ -3389,9 +3586,10 @@ components:
       type: string
       maxLength: 64
       description: >
-        Your own reference for the call, returned unchanged on the reply and on any stream event it
-        causes, so you can match them up. Omit it and we assign one. For correlation only — **it
-        does not deduplicate retries.**
+        Your own reference for the call, returned unchanged on the reply and recorded on the log
+        entry for the request, so you can match them up. Omit it and it is `null`; nothing is
+        assigned. It is not carried on event-stream items, and not on the device's own confirming
+        log entry. For correlation only — **it does not deduplicate retries.**
       example: req_01J8XA4T9K
     TimeoutMs:
       type: integer
@@ -3408,8 +3606,8 @@ components:
 
 
         **`0` is the only fire-and-forget value.** It returns `202 status: sent` immediately and
-        never returns `504`. Use it for reboot, which cannot answer, and for batches where you would
-        rather read the replies off the event stream.
+        never returns `504`. Use it for batches where you would rather read the replies off the
+        event stream. (Reboot takes no `timeoutMs` at all.)
     Confirm:
       type: boolean
       description: >
@@ -3423,8 +3621,11 @@ components:
         `requestId` you supplied so you can match the two up.
 
 
-        You get this only when you send `timeoutMs: 0`. Every other value, and omitting the field,
-        waits for the device and answers `200` or `504` instead.
+        You get this when you send `timeoutMs: 0`. Every other value, and omitting the field, waits
+        for the device and answers `200` or `504` instead. The two template deploys (`POST
+        .../config` and `POST .../load-template`) are the exception: they always answer `202` (or
+        `200 unchanged`) and do not wait. A command that cannot go out within 7 seconds is dropped
+        unsent, and anything it would change is saved only if the device then accepts it.
       required:
         - status
         - serial
@@ -3442,6 +3643,36 @@ components:
         status: sent
         serial: ABCD1234
         requestId: cfg-door-sensor
+    Unchanged:
+      type: object
+      description: >
+        The device already holds exactly this configuration, so nothing was sent and nothing
+        changed. Compared against the device's own confirmed configuration, never against what was
+        last sent to it; where that is not known, the write is sent.
+      required:
+        - status
+        - serial
+      properties:
+        status:
+          type: string
+          const: unchanged
+        serial:
+          type: string
+        requestId:
+          type:
+            - string
+            - 'null'
+        idNumber:
+          type: integer
+          description: On an ID write.
+        ruleNumber:
+          type: integer
+          description: On a rule write.
+      example:
+        status: unchanged
+        serial: ABCD1234
+        requestId: cfg-door-sensor
+        idNumber: 20
     Confirmed:
       type: object
       description: The device answered within `timeoutMs`. These fields are on every confirmed reply.
@@ -3528,7 +3759,7 @@ components:
                     - 'null'
                   description: >
                     Signal strength in **dBm** — closer to zero is stronger. Roughly, better than
-                    −70 is good and worse than −100 is marginal. Absent when unknown, never a
+                    −70 is good and worse than −100 is marginal. `null` when unknown, never a
                     placeholder.
             location:
               type:
@@ -3545,8 +3776,14 @@ components:
                 longitude:
                   type: number
                 at:
-                  type: string
+                  type:
+                    - string
+                    - 'null'
                   format: date-time
+                  description: >
+                    When this position was received. Only a live-tracking fix carries the time the
+                    device took it; a position from the device's regular status is stamped on
+                    arrival.
             ids:
               type: array
               description: Every ID configured on this device, with its last known value.
@@ -3554,20 +3791,34 @@ components:
                 $ref: '#/components/schemas/IdState'
             rules:
               type: array
-              description: Every rule on the device, in evaluation order.
+              description: >
+                Every rule on the device, in evaluation order -- the same objects `GET .../rules`
+                returns.
               items:
-                type: object
-                properties:
-                  ruleNumber:
-                    type: integer
+                $ref: '#/components/schemas/Rule'
+            deploy:
+              type:
+                - object
+                - 'null'
+              description: |
+                The last template deploy the device acknowledged in full. `null` when it has none.
+              properties:
+                lastDeployedAt:
                   type:
-                    type: string
-                    enum:
-                      - digital
-                      - analog
-                      - schedule
-                  enabled:
-                    type: boolean
+                    - string
+                    - 'null'
+                  format: date-time
+                templateVersion:
+                  type:
+                    - integer
+                    - 'null'
+                templateId:
+                  type:
+                    - string
+                    - 'null'
+            isOwner:
+              type: boolean
+              description: '`true` when you own this device -- the same fact as `access: owner`.'
             at:
               type: string
               format: date-time
@@ -3632,9 +3883,9 @@ components:
 
         an attempt refused because the device was offline is recorded exactly like one that
 
-        succeeded. Its `type` is the **verb**: `set_value`, `create_rule`, `reboot`. Filter for a
+        succeeded. Its `type` is the **verb**: `set_value`, `create_rule`, `reboot`. Filter for one
 
-        whole class with `kind=action` on the event stream, or for one verb here.
+        verb with `type` here; every entry carries its `kind`.
 
 
         **A device entry is the device reporting what actually happened**, confirmed by the hardware
@@ -3743,8 +3994,10 @@ components:
           description: >
             The coarse grouping, derived from `type` -- what a UI colour-codes on.
 
-            `action` is something a person did. `state` is an IO reporting a value. `connection` is
-            the device's availability: online, offline and rebooted all answer "can I reach it".
+            `action` is something asked of the device, and the device's confirmation that it was
+            done (a configuration change the device reports is `action` too). `state` is an IO
+            reporting a value. `connection` is the device's availability: online, offline and
+            rebooted all answer "can I reach it".
 
             **`alert` is declared but nothing produces it yet.** An alert means a threshold or rule
             condition the owner asked to be told about, and that decision has not been made. Do not
@@ -3832,8 +4085,8 @@ components:
             - string
             - 'null'
           description: >
-            Your reference, on entries caused by something you sent. **Absent on entries the device
-            raised on its own** — a self-update, a rule firing, a connection dropping.
+            Your reference, on the `action` entry for something you sent. Absent on every device
+            entry, including the device's confirmation of your own request.
     DeviceEventSettings:
       type: object
       description: >
@@ -4053,7 +4306,12 @@ components:
             Like `type`, resolved when the row is read rather than frozen when it was written.
         data:
           type: object
-          description: The event's own fields -- the IO number, the value, the rule number.
+          description: >
+            The event's own fields. Named for the stream, not the log, so they differ from
+            `LogEntry`: `id` (the ID), `rule` (the rule number), `telemetry`, `value`, `previous`,
+            `requested`, `result`, `action`, `outcome`, `stateKey`, `causedByRule` (the rule that
+            fired it) and `onBehalfOf` (the linked action ID a sensor's report is announced for).
+            Each is present only when it applies.
     PinState:
       type: string
       enum:
@@ -4153,14 +4411,15 @@ components:
         `digitalPullup` instead when the external device only pulls the line low.
       required:
         - type
-        - pin
       properties:
         type:
           type: string
           const: digitalInput
         pin:
           type: integer
-          description: The physical pin to configure.
+          description: >
+            The physical pin to configure. Required when the ID is new; on an existing ID an omitted
+            pin keeps the one it has.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4172,7 +4431,7 @@ components:
         by writing its value, or from a rule action.
       required:
         - type
-        - pin
+        - bootState
       properties:
         type:
           type: string
@@ -4188,9 +4447,9 @@ components:
             boot state means the hardware energises on every power cycle.
 
 
-            **The default is module-specific.** Check your module's documentation — it is a property
-            of the hardware, not of this API, and it is not the same on every module. Do not assume
-            a pin comes up low.
+            **Required, with no default.** Whether `low` is safe depends on wiring this API cannot
+            see — on an active-low relay `low` energises the load — so a request without it is
+            refused.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4205,7 +4464,6 @@ components:
         rather than floating unpredictably.
       required:
         - type
-        - pin
       properties:
         type:
           type: string
@@ -4238,7 +4496,6 @@ components:
         Confirm against a known reference before you build on it.
       required:
         - type
-        - pin
       properties:
         type:
           type: string
@@ -4259,8 +4516,9 @@ components:
           type: number
           description: >
             **What the sensor is reporting when the pin sits at `referenceMv`** — volts, bar,
-            degrees, litres, whatever this ID measures. Requires firmware v8.0.0 or later. `0` means
-            uncalibrated, exactly as omitting the pair does.
+            degrees, litres, whatever this ID measures. Requires firmware v8.0.0 or later. Send it
+            together with `referenceMv`, or neither. `0` means uncalibrated when `referenceMv` is
+            also `0` or omitted; one set without the other is refused.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4275,7 +4533,6 @@ components:
         the cloud, `trigger` runs in milliseconds **even while the device is offline**.
       required:
         - type
-        - pin
         - edge
         - pinMode
         - trigger
@@ -4323,11 +4580,13 @@ components:
         intervalMs:
           type: integer
           default: 0
-          description: Minimum time between fires — debounces a noisy or bouncing signal.
+          description: >
+            The counting window. The trigger fires once `threshold` edges have been counted; if this
+            window passes first, the partial count is discarded and counting starts again.
         threshold:
           type: number
           default: 0
-          description: Signal threshold, where the pin type supports one.
+          description: How many edges must be counted, within `intervalMs`, before the trigger fires.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4352,7 +4611,7 @@ components:
         or idle.
       required:
         - type
-        - pin
+        - bootState
         - triggerState
         - durationMs
         - revertState
@@ -4377,8 +4636,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/PinState'
           description: >
-            The state the pin takes on power-up. **The default is module-specific** — check your
-            module's documentation.
+            The state the pin takes on power-up. **Required, with no default** — see
+            `digitalOutput`.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4399,7 +4658,7 @@ components:
         `POST …/timer` overrides it for one shot.
       required:
         - type
-        - pin
+        - bootState
         - delayMs
         - state
       properties:
@@ -4419,8 +4678,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/PinState'
           description: >
-            The state the pin takes on power-up. **The default is module-specific** — check your
-            module's documentation.
+            The state the pin takes on power-up. **Required, with no default** — see
+            `digitalOutput`.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
         updateMode:
@@ -4525,26 +4784,6 @@ components:
             How a person reads this ID's states -- `{"0":"Closed","1":"Open"}`. Cloud metadata: it
             is never sent to the device. A value here overrides whatever the template supplies, and
             an explicit `null` clears the override rather than falling back to the template.
-        verbs:
-          type:
-            - object
-            - 'null'
-          description: |
-            Past-tense wording for each state, composing a line as
-            `<subject> <verb> <article> <name>` — "Bob opened the Main Gate". Cloud metadata, never
-            sent to the device. Each state merges independently: sending only `state1` leaves
-            `state0` alone, and an explicit `null` on one state clears just that one.
-
-            **Accepted and validated, but `states` is what composes a notification** — use
-            `states` for a comparison, a `sentence` and a channel, and `showActor` for the actor.
-            A `verbs` sentence is assembled **around the person**, so an event with no resolvable
-            actor produces no sentence and cannot be pushed. A `states` sentence is impersonal and
-            the actor is only ever **appended**, so it survives not knowing who acted.
-          properties:
-            state1:
-              $ref: '#/components/schemas/StateVerb'
-            state0:
-              $ref: '#/components/schemas/StateVerb'
         linkedIo:
           type:
             - integer
@@ -4564,10 +4803,10 @@ components:
             on a timer and reverts -- so once linked, every state read of the action ID reports its
             sensor instead, while the ID keeps its own type. The link travels in the ID's
             configuration. Changing it with a body that sets only `linkedIo` still answers `200
-            saved` at once; the configuration is then re-sent to the device in the background, and
-            is also re-sent if the linked sensor is deleted. A link to an ID the device does not
-            have is configured as unlinked until that ID exists. For every other type the link stays
-            cloud-only.
+            saved` at once (the device must be online -- an offline device cannot be configured);
+            the configuration is then re-sent to the device in the background, and is also re-sent
+            if the linked sensor is deleted. A link to an ID the device does not have is configured
+            as unlinked until that ID exists. For every other type the link stays cloud-only.
 
             A linked output's write reports the device's answer, and for these two types that answer
             is the SENSOR at that instant -- opening a gate answers `low` because it has not moved
@@ -4643,9 +4882,10 @@ components:
           maxLength: 200
           description: >
             The line a person reads. Three tokens are substituted at delivery: `{ioName}` is this
-            ID's own name, `{deviceName}` is the device's, and `{value}` is the reading that fired
-            the entry. An unknown token is left alone; a token with nothing behind it renders empty
-            and the surrounding whitespace collapses.
+            ID's own name (on the sensor of a linked pair, the name of the action ID it reports
+            for), `{deviceName}` is the device's, and `{value}` is the reading that fired the entry.
+            An unknown token is left alone; a token with nothing behind it renders empty and the
+            surrounding whitespace collapses.
 
 
             `{ioName}` NOT `{name}`: a sentence may carry the ID's name and the device's name in one
@@ -4768,40 +5008,6 @@ components:
           type: number
         max:
           type: number
-    StateVerb:
-      type:
-        - object
-        - 'null'
-      required:
-        - verb
-      properties:
-        verb:
-          type: string
-          enum:
-            - none
-            - opened
-            - closed
-            - switched on
-            - switched off
-            - activated
-            - de-activated
-            - enabled
-            - disabled
-            - raised
-            - lowered
-            - locked
-            - unlocked
-          description: >
-            An unrecognised verb is REFUSED, never defaulted -- a silent default would render "Bob
-            opened Main Gate" and read as a copy bug forever.
-        suffix:
-          type: string
-          enum:
-            - none
-            - the
-            - a
-          default: none
-          description: The article placed before the ID's name.
     UpdateIdMetadata:
       allOf:
         - $ref: '#/components/schemas/IdCreateEnvelope'
@@ -4883,6 +5089,9 @@ components:
           textVariable: '#/components/schemas/CreateTextVariable'
           math2xId: '#/components/schemas/CreateMath2xId'
     IdConfigured:
+      description: >
+        The device accepted the configuration. The body names the ID and its type; read the ID back
+        (`GET /devices/{serial}/ids/{idNumber}`) for the configuration as the device holds it.
       allOf:
         - $ref: '#/components/schemas/Confirmed'
         - type: object
@@ -4897,139 +5106,6 @@ components:
             result:
               type: string
               const: ok
-        - type: object
-          description: The configuration the device accepted, echoed back.
-          properties:
-            pin:
-              type:
-                - integer
-                - 'null'
-            bootState:
-              type:
-                - string
-                - 'null'
-            triggerState:
-              type:
-                - string
-                - 'null'
-            revertState:
-              type:
-                - string
-                - 'null'
-            durationMs:
-              type:
-                - integer
-                - 'null'
-            delayMs:
-              type:
-                - integer
-                - 'null'
-            state:
-              type:
-                - string
-                - 'null'
-            edge:
-              type:
-                - string
-                - 'null'
-            enabled:
-              type:
-                - boolean
-                - 'null'
-            intervalMs:
-              type:
-                - integer
-                - 'null'
-            threshold:
-              type:
-                - number
-                - 'null'
-            trigger:
-              oneOf:
-                - $ref: '#/components/schemas/Action'
-                - type: 'null'
-              description: >
-                What an `interrupt` fires when it trips — the same `Action` the write accepts, so it
-                can be read here and sent straight back. Null when nothing is configured.
-            referenceMv:
-              type:
-                - integer
-                - 'null'
-            maxVoltage:
-              type:
-                - number
-                - 'null'
-            pinMode:
-              type:
-                - string
-                - 'null'
-              enum:
-                - input
-                - inputPullup
-                - inputPulldown
-                - null
-              description: How an `interrupt` ID's pin is biased. Null on every other type.
-            text:
-              type:
-                - string
-                - 'null'
-            id1:
-              type:
-                - integer
-                - 'null'
-            id2:
-              type:
-                - integer
-                - 'null'
-            operator:
-              type:
-                - string
-                - 'null'
-            updateMs:
-              type:
-                - integer
-                - 'null'
-            updateMode:
-              type:
-                - string
-                - 'null'
-              enum:
-                - onChange
-                - never
-                - always
-                - null
-              description: >
-                `always` is readable here but not settable through the write schema — see
-                UpdateMode. A device configured to report `always` continues to report it.
-        - type: object
-          description: >
-            The cloud layer: what this ID MEANS, what it says, and what it is paired with. None of
-            it is held on the device.
-          properties:
-            states:
-              type:
-                - array
-                - 'null'
-              items:
-                $ref: '#/components/schemas/IdStateEntry'
-              description: >
-                The sentences this ID says, exactly as they were written, with the sentence tokens
-                **unexpanded** — `{ioName}` comes back as `{ioName}`, not as the ID's name. This is
-                the configuration, not a preview of it.
-
-
-                The effective list: the owner's, where they have set one, otherwise whatever the
-                deploy provisioned. `null` means this ID narrates nothing.
-            showActor:
-              type: boolean
-              description: Whether this ID's sentences name the person who caused the change.
-            linkedIo:
-              type:
-                - integer
-                - 'null'
-              description: >
-                The link **actually in force** — the owner's where they set one, the template's
-                otherwise, and `null` where the owner explicitly unlinked. Not the raw stored field.
     IdState:
       allOf:
         - type: object
@@ -5166,7 +5242,7 @@ components:
                 - inputPullup
                 - inputPulldown
                 - null
-              description: How an `interrupt` ID's pin is biased. Null on every other type.
+              description: How an `interrupt` ID's pin is biased. Absent on every other type.
             text:
               type:
                 - string
@@ -5199,6 +5275,64 @@ components:
               description: >
                 `always` is readable here but not settable through the write schema — see
                 UpdateMode. A device configured to report `always` continues to report it.
+        - type: object
+          description: >
+            The cloud layer: what this ID MEANS, what it says, and what it is paired with. None of
+            it is held on the device.
+          properties:
+            states:
+              type:
+                - array
+                - 'null'
+              items:
+                $ref: '#/components/schemas/IdStateEntry'
+              description: >
+                The sentences this ID says, exactly as they were written, with the sentence tokens
+                **unexpanded** — `{ioName}` comes back as `{ioName}`, not as the ID's name. This is
+                the configuration, not a preview of it.
+
+
+                The effective list: the owner's, where they have set one, otherwise whatever the
+                deploy provisioned. `null` means this ID narrates nothing.
+            showActor:
+              type: boolean
+              description: Whether this ID's sentences name the person who caused the change.
+            linkedIo:
+              type:
+                - integer
+                - 'null'
+              description: >
+                The link **actually in force** — the owner's where they set one, the template's
+                otherwise, and `null` where the owner explicitly unlinked. Not the raw stored field.
+    Saved:
+      type: object
+      description: >
+        Nothing needed to go to the device -- only cloud metadata changed (a name, states, a link,
+        keywords) -- and it is saved.
+      required:
+        - status
+        - serial
+      properties:
+        status:
+          type: string
+          const: saved
+        serial:
+          type: string
+        idNumber:
+          type: integer
+          description: On an ID write.
+        ruleNumber:
+          type: integer
+          description: On a rule write.
+        requestId:
+          type:
+            - string
+            - 'null'
+      example:
+        status: saved
+        serial: ABCD1234
+        idNumber: 20
+        requestId: rename-gate
     IdValueField:
       type:
         - number
@@ -5268,7 +5402,10 @@ components:
         at:
           type: string
           format: date-time
-          description: When the fix was **taken**, per the device's own GNSS clock — not when it reached us.
+          description: >
+            When the position was fixed. A live-tracking fix carries the time the device's GNSS
+            receiver took it; a position from the device's regular status is stamped when it reached
+            us.
     TrackPoint:
       allOf:
         - $ref: '#/components/schemas/Position'
@@ -5319,8 +5456,9 @@ components:
     TemplateDifference:
       type: object
       description: >
-        One way the device differs from its template. Compared on ID numbers, types and type
-        parameters, and on rules — **never on state**, which no template can guarantee.
+        One way the device differs from its template. For an ID: `missing`, `unexpected`, or
+        `changed` (its type or pin differs; one ID can be reported `changed` twice, once for each).
+        For a rule: only `missing`.
       properties:
         kind:
           type: string
@@ -5356,8 +5494,8 @@ components:
         configMatchesTemplate:
           type: boolean
           description: >
-            Whether the device's configuration still matches the template version it was built from.
-            `false` means it has drifted, or the template has moved on.
+            Whether the comparison found no difference against the template as stored now. See the
+            operation description for exactly what is compared.
         templateVersion:
           type:
             - integer
@@ -5468,15 +5606,15 @@ components:
     GetRulesAction:
       type: object
       description: >
-        Ask the device to list its rules. The reply arrives as a device event like any other, so a
-        rule can make the device report its own ruleset on a condition or a schedule — useful when a
-        rule has been rewriting rules and you want to see where it got to.
+        Ask the device to list its rules, on a condition or a schedule. The reply refreshes the
+        device's rule table on the platform — what `GET /devices/{serial}/rules` and the twin serve
+        — so it is a way to bring the platform's view up to date, for instance after rules were
+        enabled or disabled by other rules. **It does not appear on the log or the event stream.**
 
 
-        It is the one rule command a rule may fire. `createRule`, deleting a rule and clearing all
-        rules are not available as actions: a ruleset that edits itself while it is being evaluated
-        is the one shape the firmware cannot be reasoned about. Reading is safe because it changes
-        nothing.
+        `createRule`, deleting a rule and clearing all rules are not available as actions: a ruleset
+        that rewrites itself while it is being evaluated is the one shape the firmware cannot be
+        reasoned about. Reading is safe because it changes nothing.
       required:
         - type
       properties:
@@ -5486,7 +5624,7 @@ components:
     RefreshIdAction:
       type: object
       description: >
-        Ask the device to report one ID's value right now, on the rule's own timing, rather than
+        Ask the device to report its IDs' values right now, on the rule's own timing, rather than
         waiting for that ID's own update interval or self-update trigger. Useful for an ID that does
         not self-update often (a long `updateMs`, or `updateMode: onChange`) that you want reported
         the instant a DIFFERENT condition fires — an analog reading you want the moment a digital
@@ -5506,7 +5644,9 @@ components:
           const: refreshId
         idNumber:
           type: integer
-          description: The ID to report right now.
+          description: >
+            The ID you want reported. The device's report is device-wide -- it answers with every ID
+            -- so this names your intent; it is not sent to the device.
     CreateIdAction:
       type: object
       description: >
@@ -5809,7 +5949,9 @@ components:
         changes are not re-applied: the offset is the one in force when the rule is created. A
         window that crosses midnight UTC once converted (for example 01:00–03:00 in South Africa)
         needs device firmware 8.12.5 or later, and is refused with `422 UNPROCESSABLE` on older
-        firmware rather than accepted and never fired.
+        firmware rather than accepted and never fired. A device whose stored timezone is not one the
+        platform recognises is also refused with `422`, rather than sent a schedule converted by a
+        guess.
       required:
         - startTime
       properties:
@@ -6004,7 +6146,7 @@ components:
               type:
                 - string
                 - 'null'
-              description: The label given on create, or null.
+              description: The label given on create, or null -- also null on the same terms as `if`.
             type:
               type:
                 - string
@@ -6032,11 +6174,19 @@ components:
                 - integer
                 - 'null'
             if:
-              type: object
+              type:
+                - object
+                - 'null'
               additionalProperties: true
-              description: The condition, in the shape its type defines.
+              description: >
+                The condition as written, in the shape its type defines -- through `POST .../rules`
+                or a template deploy. `null` when it cannot be vouched for: the rule on the device
+                is no longer the one that was written (it was replaced some other way).
             then:
-              $ref: '#/components/schemas/Action'
+              description: The action as written, or `null` on the same terms as `if`.
+              oneOf:
+                - $ref: '#/components/schemas/Action'
+                - type: 'null'
             thenAtEnd:
               description: A schedule rule's end action, or null when it has none.
               oneOf:
@@ -6094,7 +6244,7 @@ components:
 openapi: 3.1.0
 info:
   title: Justworx API
-  version: 2.6.0
+  version: 2.9.0
   summary: Control and read Justworx devices.
   description: >
     One API for everything that touches a Justworx device — the same one our own apps use.
@@ -6116,7 +6266,11 @@ info:
 
     **Waiting is the default.** Every write that reaches a device blocks until the device answers,
 
-    then returns `200 status: confirmed` with the device's real state. If it stays silent you get
+    then returns `200 status: confirmed` with the device's real state. (Three calls never wait:
+
+    reboot, and the template deploys `POST .../config` and `POST .../load-template`. None of the
+
+    three accepts `timeoutMs`; sending it is a `400`.) If it stays silent you get
 
     `504 DEVICE_TIMEOUT`. Omitting `timeoutMs` does not mean "do not wait" — it means "wait the
 
@@ -6137,36 +6291,55 @@ info:
     Anything else is refused with `400 INVALID_FIELDS`.
 
 
-    **A command an offline device never receives is discarded, not queued.** It will not run later
+    **Nothing is queued for a device that cannot be reached.** An offline device cannot be seen, so
 
-    when the device reconnects. This is a safety property: a gate-open command held for two hours
+    it cannot be configured or controlled: a device already known to be offline fails immediately
 
-    and delivered later would open a gate with nobody there to expect it. A device already known to
+    with `409 DEVICE_OFFLINE`, before anything is sent, and a command is never held to run when the
 
-    be offline fails immediately with `409 DEVICE_OFFLINE`, before anything is sent.
+    device reconnects. A gate-open command held for two hours and delivered later would open a gate
 
-
-    **Reboot cannot confirm** — the device restarts before it can answer. Send `timeoutMs: 0`, or it
-
-    returns `DEVICE_TIMEOUT` 15 seconds later even though the reboot succeeded.
+    with nobody there to expect it.
 
 
-    **One command per device per 500 ms.** Commands to the same device are queued and released at
 
-    that rate — never dropped, and never refused with `429`. The first command to an idle device
+    **Nothing is saved until the device accepts it.** A change to an ID's configuration, a rule or
 
-    goes out immediately; the queue is unbounded and is per device, so work spread across devices
+    tracking is recorded only from the device's own reply. A `504`, or a command that never goes
 
-    does not contend.
+    out, leaves the record exactly as it was.
 
 
-    The consequence is worth planning for: with the default 15-second wait, roughly the **31st**
 
-    command queued for one device times out with `504` while it is still waiting its turn, even
+    **Only what changed is sent.** Writing an ID configuration or a rule that the device already
 
-    though nothing is wrong with the device. Send a batch to one device sequentially, or send
+    holds exactly sends nothing and answers `200 status: unchanged`. A template deploy sends only
 
-    `timeoutMs: 0` and watch the event stream for the replies.
+    the IDs and rules that differ.
+
+
+    **Reboot never waits.** The device restarts before it can answer, so `POST .../reboot` accepts
+    no
+
+    `timeoutMs` at all (sending one is a `400`) and always answers `202`.
+
+
+    **One command per device every 250 ms.** Commands to the same device go out one at a time at
+
+    that rate, never refused with `429`; the first command to an idle device goes out immediately,
+
+    and work spread across devices does not contend.
+
+
+
+    **A command that cannot go out in time is dropped, never sent late.** One you are waiting for
+
+    must leave within your `timeoutMs`; one sent with `timeoutMs: 0` must leave within 7 seconds.
+
+    Past that it is discarded unsent -- so a `504` really does mean the device was never told. Send
+    a
+
+    batch to one device sequentially rather than all at once.
 
 
     ## Acting for another person
