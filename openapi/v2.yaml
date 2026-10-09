@@ -153,11 +153,15 @@ paths:
         versions of the template it already came from, use `POST /devices/{serial}/config` instead —
         that call knows which version it shipped with.
 
-        **Only what differs is sent, and nothing is recorded until the device accepts it.** Each ID
-        and rule the device already holds exactly is skipped. The deploy -- when it happened, which
-        template version, and the UI design -- is recorded only once the device has acknowledged
-        every command; if it already held everything, nothing is sent and the deploy is recorded at
-        once (`200 status: unchanged`). An offline device is refused with `409`.
+        **A deploy is a default reset.** IDs and rules the device has that the template does not
+        define are removed -- including ones the owner added on that device -- and removals go
+        first. Then **only what differs is sent, and nothing is recorded until the device accepts
+        it.** Each ID and rule the device already holds exactly is skipped. The deploy -- when it
+        happened, which template version, and the UI design -- is recorded only once the device has
+        acknowledged every command; if it already held everything, nothing is sent and the deploy is
+        recorded at once (`200 status: unchanged`). An offline device is refused with `409
+        DEVICE_OFFLINE`, and a `version` that is not the template's stored version with `409
+        CONFLICT`.
       security:
         - apiKey:
             - devices:configure
@@ -265,7 +269,23 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/DeviceOffline'
+          description: Nothing was sent -- the device is offline, or `version` is not the stored version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                offline:
+                  value:
+                    error: DEVICE_OFFLINE
+                    detail: The device has been offline since 2026-08-12T09:14:02.000Z.
+                    serial: ABCD1234
+                    lastSeenAt: '2026-08-12T09:14:02.000Z'
+                versionMismatch:
+                  value:
+                    error: CONFLICT
+                    detail: template version 3 is not the stored version (4)
+                    serial: ABCD1234
         '422':
           $ref: '#/components/responses/Unprocessable'
         '500':
@@ -726,17 +746,25 @@ paths:
                 serial: ABCD1234
                 items:
                   - at: '2026-08-13T09:41:57.000Z'
+                    kind: device
                     type: value_reported
                     category: state
                     idNumber: 20
                     value: low
-                  - at: '2026-08-13T09:41:54.000Z'
+                  - at: '2026-08-13T09:41:54.300Z'
+                    kind: device
                     type: value_written
                     category: action
                     idNumber: 20
                     value: high
+                  - at: '2026-08-13T09:41:54.000Z'
+                    kind: action
+                    type: set_value
+                    category: action
+                    idNumber: 20
                     requestId: open-gate
                   - at: '2026-08-13T09:12:08.000Z'
+                    kind: presence
                     type: device_online
                     category: connection
                 nextCursor: MjAyNi0wOC0xM1QwOToxMjowOC4wMDBafGxvZ18wMDQ3
@@ -1566,24 +1594,40 @@ paths:
       tags:
         - Values
       summary: Write a value
-      description: |
-        Sets a `textVariable`, or drives an output by value.
+      description: >
+        Sets a `textVariable`, or drives an output by value. A `textVariable` value is sent exactly
+        as
+
+        written and may not contain `,` or `*` (`400 INVALID_FIELDS`).
+
 
         **On `momentaryOutput` and `delayedOutput` a write is what *fires* them** — the value you
+
         send is ignored, and the timer or delay configured on the ID is what runs.
 
+
         `force: true` drives the ID **outside the boundaries its configuration sets** and holds it,
+
         ignoring any timer or delay behaviour the ID would normally impose. The worked case: an ID
+
         configured to run for 3000 ms, which you need held for 30 seconds just this once. While a
+
         `momentaryOutput` timer runs a forced write is also the emergency stop — it takes the pin
+
         immediately and cancels the pending revert.
 
+
         If you find yourself forcing the same override repeatedly, the ID's configuration is wrong
+
         for your use case. Reconfigure it rather than working around it on every call.
 
+
         **On a `200`, `value` is the state the device reports *after* the write — its real state,
+
         not an echo of what you asked for** — and `null` when the device's reply did not include
+
         this ID. Compare the two if you need to be certain the hardware
+
         did what you intended.
       security:
         - apiKey:
@@ -2444,19 +2488,36 @@ paths:
       tags:
         - Ownership
       summary: Bring a device up to a template version
-      description: |
+      description: >
         Sends the commands that make the device's IDs and rules match a template version, **and
+
         updates its UI design to match too**. Configuration and design move together; a device
+
         brought up to date gets both.
 
-        **Only what differs is sent, and nothing is recorded until the device accepts it.** Each ID
-        and rule the device already holds exactly is skipped. The deploy -- when it happened, which
+
+        **A deploy is a default reset.** IDs and rules the device has that the template does not
+
+        define are removed -- including ones the owner added on that device -- and removals go
+        first.
+
+        Then **only what differs is sent, and nothing is recorded until the device accepts it.**
+        Each
+
+        ID and rule the device already holds exactly is skipped. The deploy -- when it happened,
+        which
+
         template version, and the UI design -- is recorded only once the device has acknowledged
+
         every command; if it already held everything, nothing is sent and the deploy is recorded at
+
         once (`200 status: unchanged`). An offline device is refused with `409`.
 
+
         > **`reset` restores the version the device *originally shipped with*, not the newest one.**
+
         > Moving to a newer version is a separate, deliberate act. "Put it back how it was" and
+
         > "give me the latest" are different intentions and are never the same call.
       security:
         - apiKey:
@@ -3370,11 +3431,12 @@ components:
         (`INVALID_FIELDS` — including a `timeoutMs` that is neither `0` nor between 1 and 30000).
 
 
-        **Bodies are closed at the top level.** A top-level property this contract does not describe
-        is rejected by name before any handler runs, so a typo in a field name is a `400`, never a
-        silently ignored field. The same applies to query parameters. Objects nested inside a body
-        (a rule's `if` and `then`, a share's `controlLevel`) are checked by their route, which
-        refuses what it cannot use.
+        **Every request is checked against this contract before any handler runs.** A property it
+        does not describe is rejected by name at any depth of a body (a rule's `if` and `then`
+        included), so a typo in a field name is a `400`, never a silently ignored field. Every
+        declared limit holds -- types, allowed values, lengths, ranges and formats -- and the same
+        applies to query parameters. A missing required field is `MISSING_FIELDS`; anything else is
+        `INVALID_FIELDS`.
 
 
         This check runs **before** the credential is checked, so a malformed request is a `400` even
@@ -4699,7 +4761,8 @@ components:
           const: textVariable
         text:
           type: string
-          description: The value the ID starts with.
+          pattern: ^[^,*]*$
+          description: The value the ID starts with. May not contain `,` or `*`.
         updateMs:
           $ref: '#/components/schemas/UpdateMs'
     Math2xIdConfig:
@@ -5864,10 +5927,10 @@ components:
             once it has been steady for half a second, and each glitch resets the timer.
 
 
-            **`forMs` must be at least the rule's `runIntervalMs`**, or the call is refused with
-            `400 INVALID_FIELDS`. The rule is only CHECKED every `runIntervalMs`, so a shorter
-            `forMs` describes a hold the device can never observe -- it would read as a debounce
-            that silently does nothing.
+            **A `forMs` above 0 must be at least the rule's `runIntervalMs`**, or the call is
+            refused with `400 INVALID_FIELDS`; 0 or omitted is always accepted. The rule is only
+            CHECKED every `runIntervalMs`, so a shorter `forMs` describes a hold the device can
+            never observe -- it would read as a debounce that silently does nothing.
     AnalogCondition:
       type: object
       description: |
@@ -5922,9 +5985,9 @@ components:
             The condition must hold this long before the rule fires.
 
 
-            **Must be at least the rule's `runIntervalMs`**, or the call is refused with `400
-            INVALID_FIELDS`. The rule is only CHECKED every `runIntervalMs`, so a shorter `forMs`
-            describes a hold the device can never observe.
+            **Above 0, must be at least the rule's `runIntervalMs`**, or the call is refused with
+            `400 INVALID_FIELDS`; 0 or omitted is always accepted. The rule is only CHECKED every
+            `runIntervalMs`, so a shorter `forMs` describes a hold the device can never observe.
     ScheduleCondition:
       type: object
       description: >
@@ -6244,7 +6307,7 @@ components:
 openapi: 3.1.0
 info:
   title: Justworx API
-  version: 2.9.0
+  version: 2.9.1
   summary: Control and read Justworx devices.
   description: >
     One API for everything that touches a Justworx device — the same one our own apps use.
@@ -6462,10 +6525,7 @@ tags:
 
       **Long poll — `GET /events`.** The request ENDS, so it survives proxies that buffer a
       never-ending response, and it needs nothing but an HTTP client. Hold it open up to 90 seconds
-      with `waitMs`; around 155ms once parked. Not only a fallback: the socket requires a `since`
-      cursor on connect, and omitting it replays your entire account history rather than starting
-      from now -- so a long-poll round always runs first, purely to obtain a cursor, even for a
-      client that then moves to the socket for everything after.
+      with `waitMs`; around 155ms once parked. On both, omitting `since` starts from now.
 
       ### The WebSocket protocol
 
