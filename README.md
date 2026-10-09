@@ -5,6 +5,6 @@ commands, and subscribe to events (WebSocket or long-poll).
 
 - **Spec:** [`openapi/v2.yaml`](openapi/v2.yaml)
 - **Base URL:** `https://api.justworx.com/api/v2`
-- **Version:** 2.5.0
+- **Version:** 2.9.1
 
 Import `openapi/v2.yaml` into Postman, Swagger UI, or any OpenAPI tool, or use it to generate a client.
